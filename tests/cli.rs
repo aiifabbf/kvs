@@ -273,7 +273,8 @@ fn compaction() -> Result<()> {
     };
 
     let mut current_size = dir_size();
-    for iter in 0..1000 {
+    for iter in 0..10 {
+        // 改小了点，不然硬盘空间不够……
         for key_id in 0..1000 {
             let key = format!("key{}", key_id);
             let value = format!("{}", iter);
