@@ -8,7 +8,11 @@ edition = "2018"
 
 [dependencies]
 clap = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
 
 [dev-dependencies]
 assert_cmd = "*"
 predicates = "*"
+tempfile = "*"
+walkdir = "*"
