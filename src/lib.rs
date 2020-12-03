@@ -50,9 +50,10 @@ enum Command {
 }
 
 pub struct KvStore {
-    map: HashMap<String, String>, // key是key，value是定义这个key-value pair最新的command的offset（好绕啊）。感觉是个坑啊，key就一定要是utf8吗？不能是bytes吗？
-    seek: usize,                  // 下一个command的offset。或者可以说是当前读了多少个command
-    path: PathBuf,                // 存log的目录。PathBuf和Path的关系类似String和&str
+    map: HashMap<String, usize>, // key是key，value是定义这个key-value pair最新的command的offset（好绕啊）。感觉是个坑啊，key就一定要是utf8吗？不能是bytes吗？
+    seek: usize,                 // 下一个command的offset。或者可以说是当前读了多少个command
+    path: PathBuf,               // 存log的目录。PathBuf和Path的关系类似String和&str
+    cache: HashMap<String, String>,
 }
 
 impl KvStore {
@@ -61,6 +62,7 @@ impl KvStore {
             map: HashMap::new(),
             seek: 0,
             path: PathBuf::new(), // 空的path会是啥呢……
+            cache: HashMap::new(),
         }
     }
 
@@ -83,7 +85,7 @@ impl KvStore {
                 file.read_to_string(&mut string)?;
                 let command: Command = serde_json::from_str(&string[..])?;
                 match command {
-                    Command::Set(key, value) => map.insert(key, value),
+                    Command::Set(key, value) => map.insert(key, i),
                     Command::Remove(key) => map.remove(&key[..]),
                 };
 
@@ -99,14 +101,36 @@ impl KvStore {
             map: map,
             seek: seek,
             path: path,
+            cache: HashMap::new(),
         });
     }
 
-    pub fn get(&self, key: &str) -> Result<Option<&str>> {
+    pub fn get(&mut self, key: &str) -> Result<Option<&str>> {
         // 标准答案里面key是String，但我觉得……怎么能传owned呢，所以改掉了
         match self.map.get(key) {
             None => Ok(None),
-            Some(value) => Ok(Some(value)),
+            Some(offset) => {
+                let mut path = self.path.clone();
+                path.push(format!("{}", offset));
+                let mut file = File::open(&path)?;
+
+                let mut string = String::new();
+                file.read_to_string(&mut string)?;
+                let command: Command = serde_json::from_str(&string[..])?;
+
+                match command {
+                    Command::Set(key, value) => {
+                        self.cache.insert(key.clone(), value); // 先放进cache
+                        Ok(self.cache.get(&key[..]).map(|v| &v[..]))
+                    }
+                    _ => {
+                        // 如果读到的是Remove，那么key应该不存在……出现了不一致，按理说这种情况是不允许发生的
+                        eprintln!("Inconsistency detected: {} in memory but not on disk", key);
+                        self.map.remove(key);
+                        Ok(None)
+                    }
+                }
+            }
         }
     }
 
@@ -119,7 +143,8 @@ impl KvStore {
         let string = serde_json::to_string(&command)?;
         file.write(string.as_bytes())?;
 
-        self.map.insert(key, value);
+        self.map.insert(key.clone(), self.seek);
+        self.cache.insert(key, value);
         self.seek += 1;
 
         Ok(())
@@ -137,6 +162,7 @@ impl KvStore {
             file.write(string.as_bytes())?;
 
             self.map.remove(key);
+            self.cache.remove(key);
             self.seek += 1;
 
             Ok(())
