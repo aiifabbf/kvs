@@ -10,6 +10,10 @@ use std::fs::rename;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+use std::net::Shutdown;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, KvsError>;
@@ -18,7 +22,8 @@ pub type Result<T> = std::result::Result<T, KvsError>;
 pub enum KvsError {
     Io(std::io::Error),
     Serde(serde_json::Error),
-    NotFound, // 我不明白为什么not found是个错误，明明用None就能表示
+    NotFound,       // 我不明白为什么not found是个错误，明明用None就能表示
+    Remote(String), // 远端错误
 }
 
 impl Display for KvsError {
@@ -43,6 +48,13 @@ impl From<serde_json::Error> for KvsError {
     fn from(error: serde_json::Error) -> Self {
         KvsError::Serde(error)
     }
+}
+
+// 听说要支持sled后端
+pub trait KvsEngine {
+    fn get(&mut self, key: &str) -> Result<Option<&str>>;
+    fn set(&mut self, key: String, value: String) -> Result<()>;
+    fn remove(&mut self, key: &str) -> Result<()>;
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -170,9 +182,11 @@ impl KvStore {
             root: root,
         });
     }
+}
 
+impl KvsEngine for KvStore {
     // 标准答案里面key是String，但我觉得……怎么能传owned呢，所以改掉了
-    pub fn get(&mut self, key: &str) -> Result<Option<&str>> {
+    fn get(&mut self, key: &str) -> Result<Option<&str>> {
         // 假设现在get("a")
         match self.map.get_mut(key) {
             None => Ok(None), // 内存和磁盘永远是一致的，内存里没有，磁盘上肯定也没有
@@ -215,7 +229,7 @@ impl KvStore {
         }
     }
 
-    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&mut self, key: String, value: String) -> Result<()> {
         // 假设set("a", "1")
         if let Some(offset) = self.map.get(&key[..]) {
             // 之前已经有a: 2了，要覆盖掉
@@ -255,7 +269,7 @@ impl KvStore {
     }
 
     // 标准答案里key也是String，我给改了
-    pub fn remove(&mut self, key: &str) -> Result<()> {
+    fn remove(&mut self, key: &str) -> Result<()> {
         // 假设删除a: 1
         if let Some(offset) = self.map.get(key).cloned() {
             // a: 1确实在数据库里，假设存在文件2里，那么如果删掉文件2，会留下2这个空洞。把最后一个command填充到文件2里，就没有空洞啦
@@ -290,6 +304,123 @@ impl KvStore {
         } else {
             // a: 1不在数据库里，数据库里面没有a这个key
             Err(KvsError::NotFound) // 再次提问……remove的时候key不存在，不管不就好了吗
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum Request {
+    Get(String),
+    Set(String, String),
+    Remove(String),
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+enum Response {
+    Done(Option<String>),
+    Failed(String),
+}
+
+pub struct KvsClient {
+    address: String,
+}
+
+impl KvsClient {
+    pub fn connect(address: String) -> Result<Self> {
+        Ok(Self { address: address }) // 假的connect，每次请求都要打开新的socket，不能复用socket
+    }
+
+    /// 发送请求，等待回应
+    fn request(&mut self, request: Request) -> Result<Response> {
+        let mut stream = TcpStream::connect(&self.address)?; // 打开socket
+        let mut string = serde_json::to_string(&request)?;
+        stream.write_all(string.as_bytes())?; // 发请求
+        stream.shutdown(Shutdown::Write)?; // 这很关键，要关闭上传通道，这样服务器才会收到EOF，不然死锁
+
+        string.clear();
+        stream.read_to_string(&mut string)?; // 收响应
+        let response: Response = serde_json::from_str(&string[..])?;
+        return Ok(response);
+    }
+
+    /// 无聊的CRUD……
+    pub fn get(&mut self, key: &str) -> Result<Option<String>> {
+        let response = self.request(Request::Get(key.to_string()))?;
+        match response {
+            Response::Done(v) => Ok(v),
+            Response::Failed(e) => Err(KvsError::Remote(e)),
+        }
+    }
+
+    pub fn set(&mut self, key: String, value: String) -> Result<()> {
+        let response = self.request(Request::Set(key, value))?;
+        match response {
+            Response::Done(_) => Ok(()),
+            Response::Failed(e) => Err(KvsError::Remote(e)),
+        }
+    }
+
+    pub fn remove(&mut self, key: &str) -> Result<()> {
+        let response = self.request(Request::Remove(key.to_string()))?;
+        match response {
+            Response::Done(_) => Ok(()),
+            Response::Failed(e) => Err(KvsError::Remote(e)),
+        }
+    }
+}
+
+pub struct KvsServer {
+    listener: TcpListener,
+    store: Box<dyn KvsEngine>,
+}
+
+impl KvsServer {
+    pub fn bind<T>(address: T) -> Result<Self>
+    where
+        T: ToSocketAddrs,
+    {
+        let listener = TcpListener::bind(address)?;
+        Ok(Self {
+            listener: listener,
+            store: Box::new(KvStore::open("./")?),
+        })
+    }
+
+    /// 只服务一次请求就return
+    fn serve(&mut self) -> Result<TcpStream> {
+        let mut stream = self.listener.accept()?.0;
+        let mut string = String::new();
+        stream.read_to_string(&mut string)?; // 收请求
+        let request: Request = serde_json::from_str(&string[..])?;
+        let response = match request {
+            Request::Get(key) => match self.store.get(&key[..]) {
+                Ok(value) => Response::Done(value.map(|v| v.to_string())),
+                Err(e) => Response::Failed(format!("{}", e)),
+            },
+            Request::Set(key, value) => match self.store.set(key, value) {
+                Ok(_) => Response::Done(None),
+                Err(e) => Response::Failed(format!("{}", e)),
+            },
+            Request::Remove(key) => match self.store.remove(&key[..]) {
+                Ok(_) => Response::Done(None),
+                Err(e) => Response::Failed(format!("{}", e)),
+            },
+        };
+        let string = serde_json::to_string(&response)?;
+        stream.write_all(string.as_bytes())?; // 发响应
+        Ok(stream)
+    }
+
+    pub fn run_forever(&mut self) {
+        loop {
+            match self.serve() {
+                Ok(stream) => {
+                    println!("{:?}", stream);
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                }
+            }
         }
     }
 }
