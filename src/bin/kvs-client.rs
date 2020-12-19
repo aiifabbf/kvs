@@ -59,7 +59,7 @@ fn main() -> Result<()> {
                 println!("{}", value);
                 Ok(())
             } else {
-                println!("Key not found"); // 为什么错误信息要print到stdout上？
+                println!("Key not found: {}", key); // 为什么错误信息要print到stdout上？
                 Ok(()) // get不存在返回的是0，可是rm不存在返回的却是1……
             }
         }
@@ -76,9 +76,9 @@ fn main() -> Result<()> {
             let mut client = KvsClient::connect(address.to_string())?;
             let key = app.value_of("KEY").unwrap();
             match client.remove(&key) {
-                Err(KvsError::NotFound) => {
-                    println!("Key not found");
-                    Err(KvsError::NotFound) // get不存在返回的是0，可是rm不存在返回的却是1……
+                Err(KvsError::NotFound { key: k }) => {
+                    println!("Key not found: {}", k);
+                    Err(KvsError::NotFound { key: k }) // get不存在返回的是0，可是rm不存在返回的却是1……
                 }
                 v => v,
             }

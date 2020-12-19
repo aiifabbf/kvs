@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use serde::Serialize;
 
+use sled::Db;
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Display;
@@ -14,6 +16,7 @@ use std::net::Shutdown;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
+use std::path::Path;
 use std::path::PathBuf;
 
 pub type Result<T> = std::result::Result<T, KvsError>;
@@ -22,14 +25,27 @@ pub type Result<T> = std::result::Result<T, KvsError>;
 pub enum KvsError {
     Io(std::io::Error),
     Serde(serde_json::Error),
-    NotFound,       // 我不明白为什么not found是个错误，明明用None就能表示
-    Remote(String), // 远端错误
+    Sled(sled::Error),
+    NotFound {
+        key: String,
+    }, // 我不明白为什么not found是个错误，明明用None就能表示
+    Remote {
+        message: String,
+    }, // 远端错误
+    UnsupportedEngine {
+        name: String,
+    },
+    BadArchive {
+        path: PathBuf,
+        should: String, // 应该是什么engine
+        tried: String,  // 现在试图用什么engine打开
+    }, // 如果磁盘上的持久化明明是sled engine，但是现在要运行kvs engine，就会出这个错误
 }
 
 impl Display for KvsError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            KvsError::NotFound => write!(f, "Key not found"),
+            KvsError::NotFound { key: k } => write!(f, "Key not found: {}", k),
             _ => write!(f, "{}", format!("{:#?}", self)),
         }
     }
@@ -47,6 +63,12 @@ impl From<std::io::Error> for KvsError {
 impl From<serde_json::Error> for KvsError {
     fn from(error: serde_json::Error) -> Self {
         KvsError::Serde(error)
+    }
+}
+
+impl From<sled::Error> for KvsError {
+    fn from(error: sled::Error) -> Self {
+        KvsError::Sled(error)
     }
 }
 
@@ -83,6 +105,21 @@ pub struct KvStore {
     root: PathBuf,
 }
 
+/// 目录下面建一个叫做.kvs的文件，如果里面存kvs，说明当前目录的记录是kvs engine；如果存sled，说明是sled engine
+fn archive_type<T>(root: T) -> Result<String>
+where
+    T: AsRef<Path>,
+{
+    match File::open(root.as_ref().join(".kvs")) {
+        Ok(mut manifest) => {
+            let mut string = String::new();
+            manifest.read_to_string(&mut string)?;
+            Ok(string)
+        }
+        Err(e) => Err(KvsError::Io(e)),
+    }
+}
+
 impl KvStore {
     pub fn new() -> Self {
         Self {
@@ -100,15 +137,34 @@ impl KvStore {
         let root = root.into();
         create_dir_all(&root)?; // 把存log的目录先建了
 
+        match archive_type(&root) {
+            Ok(name) => {
+                if name != "kvs" {
+                    // 发现当前目录存了其他engine的记录
+                    return Err(KvsError::BadArchive {
+                        path: root,
+                        should: name,
+                        tried: format!("kvs"),
+                    });
+                }
+            }
+            Err(KvsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 当前目录是新的，没有存过任何engine的记录
+                let mut file = File::create(root.join(".kvs"))?;
+                file.write("kvs".as_bytes())?;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
         let mut map = HashMap::new();
         let mut logs = vec![];
         let mut seek = 0;
 
         for i in 0.. {
             // 把command一个一个读出来
-            let mut path = root.clone();
-            path.push(format!("{}", i)); // 第10个command的路径是path/10
-
+            let path = root.join(format!("{}", i)); // 第10个command的路径是path/10
             if let Ok(mut file) = File::open(&path) {
                 let mut string = String::new();
                 file.read_to_string(&mut string)?;
@@ -117,13 +173,11 @@ impl KvStore {
                     Command::Set(key, _) => {
                         if let Some(offset) = map.get(&key[..]).cloned() {
                             // 之前出现过a: 1了，假设存在文件1里，现在又来了个a: 2，假设存在文件5里。直接把5重命名为2就好了，其他什么都不用变
-                            let mut new_path = root.clone();
-                            new_path.push(format!("{}", offset));
+                            let new_path = root.join(format!("{}", offset)); // 原来还有join这个好用的方法……
                             rename(&path, &new_path)?; // 把5重命名为2
                         } else {
                             // 来了个a: 1，之前没见过，把a: 1存在名为seek的文件里
-                            let mut new_path = root.clone();
-                            new_path.push(format!("{}", seek));
+                            let new_path = root.join(format!("{}", seek));
                             rename(&path, &new_path)?;
 
                             map.insert(key.clone(), seek); // 更新map，让map[a] = seek
@@ -137,10 +191,8 @@ impl KvStore {
                             if seek != 0 {
                                 // 假设这时候有6个command，那么此时seek = 6
                                 seek -= 1; // 先把seek往下移动一格，这样seek = 5
-                                let mut path = root.clone();
-                                path.push(format!("{}", seek)); // 最后一个command存放在文件5里
-                                let mut new_path = root.clone();
-                                new_path.push(format!("{}", offset)); // 假设要删除的a: 1存在文件2里
+                                let path = root.join(format!("{}", seek)); // 最后一个command存放在文件5里
+                                let new_path = root.join(format!("{}", offset)); // 假设要删除的a: 1存在文件2里
                                 rename(&path, &new_path)?; // 把文件5重命名为2就好了，这样a: 1就跑到文件2里去了
 
                                 // 更新一下内存里的表示
@@ -161,12 +213,9 @@ impl KvStore {
                 }
             } else {
                 // 0, 1, 2发现没有3，说明读完了
-                path.pop();
-
                 // [seek, i)之间的文件都是冗余的，全部删掉
                 for j in seek..i {
-                    let mut path = root.clone();
-                    path.push(format!("{}", j));
+                    let path = root.join(format!("{}", j));
                     remove_file(&path)?;
                 }
 
@@ -196,8 +245,7 @@ impl KvsEngine for KvStore {
                 match storage {
                     Storage::Disk(offset) => {
                         // logs[2] == ("a", Disk(2))，在磁盘上还没读出来
-                        let mut path = self.root.clone();
-                        path.push(format!("{}", offset)); // a存在文件2里
+                        let path = self.root.join(format!("{}", offset)); // a存在文件2里
                         let mut file = File::open(&path)?;
 
                         let mut string = String::new();
@@ -233,8 +281,7 @@ impl KvsEngine for KvStore {
         // 假设set("a", "1")
         if let Some(offset) = self.map.get(&key[..]) {
             // 之前已经有a: 2了，要覆盖掉
-            let mut path = self.root.clone();
-            path.push(format!("{}", offset)); // 假设之前的a: 2存在文件5里
+            let path = self.root.join(format!("{}", offset)); // 假设之前的a: 2存在文件5里
             let mut file = File::create(&path)?; // 直接把文件5清空，写入a: 1
 
             let command = Command::Set(key.clone(), value.clone());
@@ -251,8 +298,7 @@ impl KvsEngine for KvStore {
             }
         } else {
             // 之前没见过a，假设当前总共有6个command，那么要把a: 1写到文件6里
-            let mut path = self.root.clone(); // 其实没必要clone
-            path.push(format!("{}", self.seek)); // a: 1应该存到文件6里
+            let path = self.root.join(format!("{}", self.seek)); // a: 1应该存到文件6里
             let mut file = File::create(&path)?; // 但万一这里提前return了……
 
             let command = Command::Set(key.clone(), value.clone());
@@ -274,10 +320,8 @@ impl KvsEngine for KvStore {
         if let Some(offset) = self.map.get(key).cloned() {
             // a: 1确实在数据库里，假设存在文件2里，那么如果删掉文件2，会留下2这个空洞。把最后一个command填充到文件2里，就没有空洞啦
             self.seek -= 1; // 假设现在数据库里有6个command，所以seek是6，最后一个command存在文件5里
-            let mut path = self.root.clone();
-            path.push(format!("{}", self.seek)); // 最后一个command存在文件5里
-            let mut new_path = self.root.clone();
-            new_path.push(format!("{}", offset)); // 要删除的a: 1存在文件2里
+            let path = self.root.join(format!("{}", self.seek)); // 最后一个command存在文件5里
+            let new_path = self.root.join(format!("{}", offset)); // 要删除的a: 1存在文件2里
 
             if self.seek != offset {
                 rename(&path, &new_path)?; // 把文件5重命名为2，就填充了2这个空洞
@@ -303,7 +347,85 @@ impl KvsEngine for KvStore {
             Ok(())
         } else {
             // a: 1不在数据库里，数据库里面没有a这个key
-            Err(KvsError::NotFound) // 再次提问……remove的时候key不存在，不管不就好了吗
+            Err(KvsError::NotFound {
+                key: key.to_string(),
+            }) // 再次提问……remove的时候key不存在，不管不就好了吗
+        }
+    }
+}
+
+// 这个名字起的实在是太奇怪了，Engine让人感觉是interface，可是这里SledKvsEngine却又是个struct。按照这样的命名，KvsStore也应该改名叫KvsStoreEngine
+pub struct SledKvsEngine {
+    store: Db,
+    stash: Option<String>,
+}
+
+impl SledKvsEngine {
+    pub fn open<T>(root: T) -> Result<Self>
+    where
+        T: Into<PathBuf>,
+    {
+        let root = root.into();
+        create_dir_all(&root)?;
+
+        match archive_type(&root) {
+            Ok(name) => {
+                if name != "sled" {
+                    return Err(KvsError::BadArchive {
+                        path: root,
+                        should: name,
+                        tried: format!("sled"),
+                    });
+                }
+            }
+            Err(KvsError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                let mut file = File::create(root.join(".kvs"))?;
+                file.write("sled".as_bytes())?;
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        }
+
+        Ok(Self {
+            store: sled::open(root)?,
+            stash: None,
+        })
+    }
+}
+
+impl KvsEngine for SledKvsEngine {
+    fn get(&mut self, key: &str) -> Result<Option<&str>> {
+        match self.store.get(key.as_bytes()) {
+            Ok(Some(v)) => {
+                self.stash = Some(std::str::from_utf8(v.as_ref()).unwrap().to_string());
+                Ok(self.stash.as_ref().map(|v| &v[..])) // 因为存的时候只允许存String，所以这里应该不会panic
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(KvsError::Sled(e)),
+        }
+    }
+
+    fn set(&mut self, key: String, value: String) -> Result<()> {
+        match self.store.insert(key.as_bytes(), value.as_bytes()) {
+            Ok(_) => {
+                self.store.flush()?; // 巨坑，千万千万不要忘记flush，这样才会写回磁盘
+                Ok(())
+            }
+            Err(e) => Err(KvsError::Sled(e)),
+        }
+    }
+
+    fn remove(&mut self, key: &str) -> Result<()> {
+        match self.store.remove(key.as_bytes()) {
+            Ok(Some(_)) => {
+                self.store.flush()?;
+                Ok(())
+            }
+            Ok(None) => Err(KvsError::NotFound {
+                key: key.to_string(),
+            }), // 到底是为什么key不存在算是个错误
+            Err(e) => Err(KvsError::Sled(e)),
         }
     }
 }
@@ -348,7 +470,7 @@ impl KvsClient {
         let response = self.request(Request::Get(key.to_string()))?;
         match response {
             Response::Done(v) => Ok(v),
-            Response::Failed(e) => Err(KvsError::Remote(e)),
+            Response::Failed(e) => Err(KvsError::Remote { message: e }),
         }
     }
 
@@ -356,7 +478,7 @@ impl KvsClient {
         let response = self.request(Request::Set(key, value))?;
         match response {
             Response::Done(_) => Ok(()),
-            Response::Failed(e) => Err(KvsError::Remote(e)),
+            Response::Failed(e) => Err(KvsError::Remote { message: e }),
         }
     }
 
@@ -364,63 +486,66 @@ impl KvsClient {
         let response = self.request(Request::Remove(key.to_string()))?;
         match response {
             Response::Done(_) => Ok(()),
-            Response::Failed(e) => Err(KvsError::Remote(e)),
+            Response::Failed(e) => Err(KvsError::Remote { message: e }),
         }
     }
 }
 
-pub struct KvsServer {
-    listener: TcpListener,
-    store: Box<dyn KvsEngine>,
+pub struct KvsServer<T> {
+    engine: T,
 }
 
-impl KvsServer {
-    pub fn bind<T>(address: T) -> Result<Self>
-    where
-        T: ToSocketAddrs,
-    {
-        let listener = TcpListener::bind(address)?;
-        Ok(Self {
-            listener: listener,
-            store: Box::new(KvStore::open("./")?),
-        })
+impl<T> KvsServer<T>
+where
+    T: KvsEngine,
+{
+    pub fn new(engine: T) -> Self {
+        Self { engine: engine }
     }
 
     /// 只服务一次请求就return
-    fn serve(&mut self) -> Result<TcpStream> {
-        let mut stream = self.listener.accept()?.0;
+    fn serve(&mut self, stream: &mut TcpStream) -> Result<()> {
         let mut string = String::new();
         stream.read_to_string(&mut string)?; // 收请求
         let request: Request = serde_json::from_str(&string[..])?;
         let response = match request {
-            Request::Get(key) => match self.store.get(&key[..]) {
+            Request::Get(key) => match self.engine.get(&key[..]) {
                 Ok(value) => Response::Done(value.map(|v| v.to_string())),
                 Err(e) => Response::Failed(format!("{}", e)),
             },
-            Request::Set(key, value) => match self.store.set(key, value) {
+            Request::Set(key, value) => match self.engine.set(key, value) {
                 Ok(_) => Response::Done(None),
                 Err(e) => Response::Failed(format!("{}", e)),
             },
-            Request::Remove(key) => match self.store.remove(&key[..]) {
+            Request::Remove(key) => match self.engine.remove(&key[..]) {
                 Ok(_) => Response::Done(None),
                 Err(e) => Response::Failed(format!("{}", e)),
             },
         };
         let string = serde_json::to_string(&response)?;
         stream.write_all(string.as_bytes())?; // 发响应
-        Ok(stream)
+        Ok(())
     }
 
-    pub fn run_forever(&mut self) {
-        loop {
-            match self.serve() {
-                Ok(stream) => {
-                    println!("{:?}", stream);
-                }
-                Err(e) => {
-                    eprintln!("{}", e);
-                }
+    /// 在某个ip:port上一直处理请求
+    pub fn run<U>(&mut self, address: U) -> Result<()>
+    where
+        U: ToSocketAddrs,
+    {
+        let listener = TcpListener::bind(address)?;
+        for stream in listener.incoming() {
+            match stream {
+                Ok(mut stream) => match self.serve(&mut stream) {
+                    Ok(_) => {
+                        println!("{:?}", stream);
+                    }
+                    Err(e) => {
+                        eprintln!("{}", e);
+                    }
+                },
+                Err(e) => eprintln!("{}", e),
             }
         }
+        Ok(())
     }
 }
